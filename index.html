@@ -46,7 +46,7 @@ details{margin-top:12px}summary{cursor:pointer;font-weight:600}.empty{text-align
 </div>
 
 <div class="card">
-  <div class="stats">
+  <div class="stats"><div class="stat">Source : <b>Jikan / MyAnimeList</b></div>
     <div class="stat"><b id="animeCount">0</b> anime</div>
     <div class="stat"><b id="dueCount">0</b> épisodes à rattraper</div>
     <div class="stat"><b id="seenCount">0</b> épisodes vus</div>
@@ -77,66 +77,116 @@ function fmtDate(d){if(!d)return 'Date inconnue';return new Intl.DateTimeFormat(
 function allEpisodes(a){return a.episodes||[]}
 function dueEpisodes(){const now=Date.now();let out=[];state.anime.forEach(a=>allEpisodes(a).forEach(e=>{if(e.aired && new Date(e.aired).getTime()<=now && !state.seen[a.id+'-'+e.mal_id])out.push({...e,anime:a});}));return out.sort((x,y)=>new Date(x.aired)-new Date(y.aired));}
 
-async function searchAnime(){
- const q=document.getElementById('search').value.trim();
- if(!q)return;
- const box=document.getElementById('searchResults');
- box.innerHTML='<div class="muted">Recherche sur MyAnimeList…</div>';
- try{
-  const r=await fetch(API+'/anime?q='+encodeURIComponent(q)+'&limit=8&sfw=true');
-  if(!r.ok)throw new Error('HTTP '+r.status);
-  const j=await r.json();
-  box.innerHTML=(j.data||[]).map(a=>`<div class="result">
-    <div><b>${esc(a.title)}</b><div class="meta">${esc(a.type||'')} · ${esc(a.status||'')} · MAL #${a.mal_id}</div></div>
-    <button onclick="addAnime(${a.mal_id})">Ajouter</button>
-  </div>`).join('')||'<div class="muted">Aucun résultat.</div>';
- }catch(e){
-  console.error(e);
-  box.innerHTML='<div class="notice">La recherche n’a pas pu contacter Jikan. Si tu ouvres encore ce fichier en <code>file://</code>, c’est normal : utilise la version hébergée sur GitHub Pages. Une fois hébergée en <code>https://</code>, cette requête pourra être faite par le navigateur.</div>';
- }
+async function jikan(path){
+  const r=await fetch(API+path,{headers:{'Accept':'application/json'}});
+  if(!r.ok){
+    let msg='HTTP '+r.status;
+    try{const j=await r.json(); if(j.message)msg+=' — '+j.message;}catch(_){}
+    throw new Error(msg);
+  }
+  return r.json();
 }
 
-async function getRecentEpisodes(id){
- // Jikan pagine les épisodes par 100. On récupère la dernière page
- // (et la précédente si elle existe) afin de privilégier les épisodes récents.
- const first=await fetch(API+'/anime/'+id+'/episodes?page=1');
- if(!first.ok)throw new Error('episodes '+first.status);
- const firstJson=await first.json();
- const lastPage=firstJson.pagination?.last_visible_page||1;
- const pages=[lastPage];
- if(lastPage>1)pages.push(lastPage-1);
- const all=[];
- for(const p of pages){
-  const r=await fetch(API+'/anime/'+id+'/episodes?page='+p);
-  if(!r.ok)throw new Error('episodes '+r.status);
-  const j=await r.json();
-  all.push(...(j.data||[]));
- }
- const seen=new Set();
- return all.filter(e=>{if(seen.has(e.mal_id))return false;seen.add(e.mal_id);return true;});
+function animeFromMAL(a, episodes=[]){
+  return {
+    id:a.mal_id,
+    title:a.title,
+    titleEnglish:a.title_english||'',
+    image:a.images?.jpg?.image_url||'',
+    status:a.status||'',
+    type:a.type||'',
+    broadcast:a.broadcast||null,
+    episodes:episodes.map(e=>({
+      mal_id:e.mal_id,
+      number:e.mal_id,
+      title:e.title||'',
+      aired:e.aired||null
+    }))
+  };
+}
+
+async function fetchAnime(id){
+  const main=(await jikan('/anime/'+id)).data;
+  const epData=(await jikan('/anime/'+id+'/episodes?page=1'));
+  const last=epData.pagination?.last_visible_page||1;
+  const pages=[last];
+  if(last>1)pages.push(last-1);
+  let eps=[];
+  for(const page of pages){
+    const j=page===1?epData:await jikan('/anime/'+id+'/episodes?page='+page);
+    eps.push(...(j.data||[]));
+  }
+  const seen=new Set();
+  eps=eps.filter(e=>!seen.has(e.mal_id)&&(seen.add(e.mal_id),true));
+  return animeFromMAL(main,eps);
+}
+
+async function searchAnime(){
+  const q=document.getElementById('search').value.trim();
+  if(!q)return;
+  const box=document.getElementById('searchResults');
+  box.innerHTML='<div class="muted">Recherche…</div>';
+
+  // Jikan's search endpoint can occasionally return 504 when MAL is unavailable.
+  // We keep it as the normal route, with a clear fallback to MAL ID input.
+  try{
+    const j=await jikan('/anime?q='+encodeURIComponent(q)+'&limit=8&sfw=true');
+    box.innerHTML=(j.data||[]).map(a=>`<div class="result">
+      <div><b>${esc(a.title)}</b><div class="meta">${esc(a.type||'')} · ${esc(a.status||'')} · MAL #${a.mal_id}</div></div>
+      <button onclick="addAnime(${a.mal_id})">Ajouter</button>
+    </div>`).join('')||'<div class="muted">Aucun résultat.</div>';
+  }catch(e){
+    console.error(e);
+    box.innerHTML=`<div class="notice">
+      La recherche Jikan est temporairement indisponible (${esc(e.message)}).
+      <br><br>
+      <b>Solution de secours :</b> si tu connais le numéro MAL de l'anime, entre-le ici :
+      <div class="toolbar" style="margin-top:8px">
+        <input id="malIdFallback" type="number" placeholder="Ex. 21 pour One Piece">
+        <button onclick="addAnime(Number(document.getElementById('malIdFallback').value))">Ajouter via MAL ID</button>
+      </div>
+    </div>`;
+  }
 }
 
 async function addAnime(id){
- if(state.anime.some(a=>a.id===id)){alert('Cet anime est déjà dans ta liste.');return;}
- const box=document.getElementById('searchResults');
- box.innerHTML='<div class="muted">Récupération des informations et des épisodes récents…</div>';
- try{
-  const mainR=await fetch(API+'/anime/'+id);
-  if(!mainR.ok)throw new Error('anime '+mainR.status);
-  const main=await mainR.json();
-  const eps=await getRecentEpisodes(id);
-  const a=main.data;
-  state.anime.push({
-   id:a.mal_id,title:a.title,titleEnglish:a.title_english||'',image:a.images?.jpg?.image_url||'',
-   status:a.status,type:a.type,
-   episodes:eps.map(e=>({mal_id:e.mal_id,number:e.mal_id,title:e.title||'',aired:e.aired||null}))
-  });
+  if(!Number.isInteger(id)||id<=0){alert('MAL ID invalide.');return;}
+  if(state.anime.some(a=>a.id===id)){alert('Cet anime est déjà dans ta liste.');return;}
+  const box=document.getElementById('searchResults');
+  box.innerHTML='<div class="muted">Récupération de l’anime et de ses épisodes récents…</div>';
+  try{
+    const a=await fetchAnime(id);
+    state.anime.push(a);
+    save();
+    box.innerHTML='';
+  }catch(e){
+    console.error(e);
+    box.innerHTML=`<div class="notice">Impossible de récupérer cet anime : ${esc(e.message)}</div>`;
+  }
+}
+
+async function syncAnime(a){
+  const fresh=await fetchAnime(a.id);
+  // Preserve nothing except local watch state: public data is refreshed from Jikan.
+  a.title=fresh.title;
+  a.titleEnglish=fresh.titleEnglish;
+  a.image=fresh.image;
+  a.status=fresh.status;
+  a.type=fresh.type;
+  a.broadcast=fresh.broadcast;
+  const old=new Map((a.episodes||[]).map(e=>[e.mal_id,e]));
+  a.episodes=fresh.episodes;
+  // Do not delete watched state; it is stored independently in state.seen.
+  return old.size!==fresh.episodes.length;
+}
+
+async function syncAll(btn){
+  if(btn){btn.disabled=true;btn.textContent='Synchronisation…';}
+  for(const a of state.anime){
+    try{await syncAnime(a);}catch(e){console.error('sync',a.title,e);}
+  }
   save();
-  document.getElementById('searchResults').innerHTML='';
- }catch(e){
-  console.error(e);
-  box.innerHTML='<div class="notice">Impossible de récupérer cet anime pour le moment. Vérifie que la page est bien ouverte depuis une adresse <code>https://</code>, puis réessaie.</div>';
- }
+  if(btn){btn.disabled=false;btn.textContent='↻ Synchroniser tous les anime';}
 }
 
 function toggleSeen(aid,eid,checked){const k=aid+'-'+eid;if(checked)state.seen[k]=true;else delete state.seen[k];save();}
