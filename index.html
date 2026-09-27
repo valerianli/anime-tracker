@@ -63,7 +63,7 @@ details{margin-top:12px}summary{cursor:pointer;font-weight:600}.empty{text-align
   <div id="animeList"></div>
 </div>
 
-<div class="notice">Les données personnelles (épisodes vus, liste, etc.) sont stockées localement dans ce navigateur. Les informations d'anime et de diffusion sont récupérées depuis Jikan, une API publique basée sur MyAnimeList. Si tu partages ce fichier à un ami, chacun aura son propre suivi.</div>
+<div class="notice">ℹ️ Les synchronisations sont volontairement espacées pour respecter les limites de Jikan.</div><div class="notice">Les données personnelles (épisodes vus, liste, etc.) sont stockées localement dans ce navigateur. Les informations d'anime et de diffusion sont récupérées depuis Jikan, une API publique basée sur MyAnimeList. Si tu partages ce fichier à un ami, chacun aura son propre suivi.</div>
 </div>
 
 <script>
@@ -77,14 +77,32 @@ function fmtDate(d){if(!d)return 'Date inconnue';return new Intl.DateTimeFormat(
 function allEpisodes(a){return a.episodes||[]}
 function dueEpisodes(){const now=Date.now();let out=[];state.anime.forEach(a=>allEpisodes(a).forEach(e=>{if(e.aired && new Date(e.aired).getTime()<=now && !state.seen[a.id+'-'+e.mal_id])out.push({...e,anime:a});}));return out.sort((x,y)=>new Date(x.aired)-new Date(y.aired));}
 
-async function jikan(path){
-  const r=await fetch(API+path,{headers:{'Accept':'application/json'}});
-  if(!r.ok){
-    let msg='HTTP '+r.status;
-    try{const j=await r.json(); if(j.message)msg+=' — '+j.message;}catch(_){}
-    throw new Error(msg);
-  }
-  return r.json();
+let jikanQueue=Promise.resolve();
+const JIKAN_DELAY=1100; // keep safely below the public API rate limit
+
+function sleep(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
+
+function jikan(path){
+  const job=jikanQueue.then(async()=>{
+    await sleep(JIKAN_DELAY);
+    for(let attempt=0;attempt<4;attempt++){
+      const r=await fetch(API+path,{headers:{'Accept':'application/json'}});
+      if(r.status===429){
+        const wait=3000*(attempt+1);
+        await sleep(wait);
+        continue;
+      }
+      if(!r.ok){
+        let msg='HTTP '+r.status;
+        try{const j=await r.json(); if(j.message)msg+=' — '+j.message;}catch(_){}
+        throw new Error(msg);
+      }
+      return r.json();
+    }
+    throw new Error('HTTP 429 — Jikan limite temporairement les requêtes. Réessaie dans quelques secondes.');
+  });
+  jikanQueue=job.catch(()=>{});
+  return job;
 }
 
 function animeFromMAL(a, episodes=[]){
@@ -153,7 +171,7 @@ async function addAnime(id){
   if(!Number.isInteger(id)||id<=0){alert('MAL ID invalide.');return;}
   if(state.anime.some(a=>a.id===id)){alert('Cet anime est déjà dans ta liste.');return;}
   const box=document.getElementById('searchResults');
-  box.innerHTML='<div class="muted">Récupération de l’anime et de ses épisodes récents…</div>';
+  box.innerHTML='<div class="muted">Récupération de l’anime et de ses épisodes récents… Cela peut prendre quelques secondes pour respecter les limites de Jikan.</div>';
   try{
     const a=await fetchAnime(id);
     state.anime.push(a);
