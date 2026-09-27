@@ -182,7 +182,7 @@ function mergeEpisodes(a,eps){
   a.episodes=[...map.values()].sort((x,y)=>Number(x.number)-Number(y.number));
 }
 
-async function rawJikan(path, timeoutMs=9000){
+async function rawJikan(path, timeoutMs=7000){
   const controller=new AbortController();
   const timer=setTimeout(()=>controller.abort(),timeoutMs);
   try{
@@ -199,47 +199,47 @@ async function rawJikan(path, timeoutMs=9000){
   }finally{clearTimeout(timer);}
 }
 
-async function jikan(path){
+// Une seule file, avec un espacement modéré. On évite les longues chaînes de retries :
+// un 504 Jikan/MAL ne doit pas bloquer toute l'application pendant 30+ secondes.
+async function jikan(path, options={}){
+  const delay=options.delay ?? JIKAN_DELAY;
+  const timeout=options.timeout ?? 7000;
+  const retry429=options.retry429!==false;
   const job=jikanQueue.then(async()=>{
-    await sleep(JIKAN_DELAY);
-    let lastErr=null;
-    for(let attempt=0;attempt<4;attempt++){
-      try{return await rawJikan(path,10000);}
-      catch(e){
-        lastErr=e;
-        const msg=String(e.message||'');
-        const retryable=/HTTP (429|500|502|503|504)|délai d’attente/i.test(msg);
-        if(!retryable || attempt===3)throw e;
-        await sleep(msg.includes('HTTP 429')?3500*(attempt+1):1800*(attempt+1));
+    await sleep(delay);
+    try{
+      return await rawJikan(path,timeout);
+    }catch(e){
+      const msg=String(e.message||'');
+      // 429 : un seul nouvel essai après une courte pause.
+      if(retry429 && /HTTP 429/.test(msg)){
+        await sleep(3500);
+        return await rawJikan(path,timeout);
       }
+      throw e;
     }
-    throw lastErr||new Error('Jikan indisponible.');
   });
   jikanQueue=job.catch(()=>{});
   return job;
 }
 
-async function fetchEpisodePage(id,page){return await jikan('/anime/'+id+'/episodes?page='+page);}
+async function fetchEpisodePage(id,page){
+  return await jikan('/anime/'+id+'/episodes?page='+page,{delay:JIKAN_DELAY,timeout:7000});
+}
+
 async function fetchAnime(id){
-  const main=(await jikan('/anime/'+id)).data;
+  // IMPORTANT : lors de l'ajout, un seul appel est nécessaire.
+  // Les épisodes seront chargés lors de la synchronisation, afin qu'un 504
+  // sur /episodes ne fasse pas échouer l'ajout de l'anime.
+  const main=(await jikan('/anime/'+id,{delay:JIKAN_DELAY,timeout:7000,retry429:true})).data;
   if(!main)throw new Error('Anime introuvable sur MyAnimeList.');
-  let first=null;
-  try{first=await fetchEpisodePage(id,1);}catch(e){first=null;}
-  const firstData=first?.data||[];
-  const lastPage=Number(first?.pagination?.last_visible_page||1);
-  let lastData=[];
-  if(lastPage>1){
-    try{const last=await fetchEpisodePage(id,lastPage);lastData=last?.data||[];}catch(e){lastData=[];}
-  }else lastData=firstData;
-  const eps=[...firstData,...lastData];
-  const knownMax=eps.map(e=>Number(e.number)).filter(Number.isFinite).reduce((m,n)=>Math.max(m,n),0);
   const totalFromMAL=Number.isFinite(Number(main.episodes))?Number(main.episodes):null;
-  const totalEpisodes=totalFromMAL||knownMax||null;
   return {
     id:main.mal_id,title:main.title,titleEnglish:main.title_english||'',image:main.images?.jpg?.image_url||'',
     status:main.status||'',type:main.type||'',broadcast:main.broadcast||null,
-    totalEpisodes:totalEpisodes,
-    episodes:eps.map(normalizeEpisode),progressMode:'specific',lastWatched:0,lastSynced:Date.now()
+    totalEpisodes:totalFromMAL,
+    episodes:[],progressMode:'specific',lastWatched:0,lastSynced:Date.now(),
+    episodesSyncError:null
   };
 }
 
@@ -292,7 +292,7 @@ async function addAnime(id){
   const box=document.getElementById('searchResults');box.innerHTML='<div class="muted">Récupération des informations…</div>';
   try{
     const a=await fetchAnime(id);
-    state.anime.push(a);state.lastSync=Date.now();save();box.innerHTML='';
+    state.anime.push(a);save();box.innerHTML='';
     openProgress(a.id,true);
   }catch(e){box.innerHTML='<div class="notice">Impossible de récupérer cet anime : '+esc(e.message)+'<br><span class="small">Si le problème persiste, réessaie dans quelques secondes : Jikan peut temporairement être indisponible.</span></div>';}
 }
@@ -301,7 +301,8 @@ function openProgress(id,first=false){
   const a=getAnime(id);if(!a)return;
   progressAnimeId=id;
   document.getElementById('progressTitle').textContent=first?'Où en es-tu dans '+a.title+' ?':'Modifier ma progression';
-  const total=a.totalEpisodes?`Nombre total d’épisodes connu : ${a.totalEpisodes}.`:'Le nombre total d’épisodes n’est pas encore connu.';
+  const latest=latestReleasedNumber(a);
+  const total=a.totalEpisodes?`Nombre total d’épisodes : ${a.totalEpisodes}.`:(latest?`MAL ne donne pas de nombre final. Dernier épisode actuellement connu : ${latest}.`:'Le nombre total d’épisodes n’est pas encore connu.');
   document.getElementById('progressInfo').textContent=total;
   const input=document.getElementById('progressInput');
   input.value=Number(a.lastWatched||0);
@@ -319,6 +320,9 @@ function saveProgress(){
   a.progressMode=(a.totalEpisodes&&n>=a.totalEpisodes)?'up_to_date':'specific';
   a.lastWatched=n;
   save();closeProgress();
+  // Après avoir indiqué sa progression, on récupère les épisodes nécessaires
+  // pour calculer précisément le rattrapage, sans télécharger tout l'historique.
+  if(!a.episodes.length || !latestReleasedNumber(a)) syncOne(a.id,true);
 }
 function markNextWatched(id){
   const a=getAnime(id);if(!a)return;
@@ -337,19 +341,40 @@ async function ensureEpisodeInfo(a,n){
 }
 
 async function syncAnime(a){
-  const main=(await jikan('/anime/'+a.id)).data;
+  // 1 appel principal pour les métadonnées + 1 appel épisodes pour connaître
+  // la pagination, puis 1 appel vers la dernière page uniquement si nécessaire.
+  const main=(await jikan('/anime/'+a.id,{delay:JIKAN_DELAY,timeout:7000,retry429:true})).data;
   if(!main)throw new Error('Anime introuvable.');
-  a.title=main.title||a.title;a.titleEnglish=main.title_english||a.titleEnglish;a.image=main.images?.jpg?.image_url||a.image;
-  a.status=main.status||a.status;a.type=main.type||a.type;a.broadcast=main.broadcast||a.broadcast;
-  a.totalEpisodes=Number.isFinite(Number(main.episodes))?Number(main.episodes):a.totalEpisodes;
+  a.title=main.title||a.title;
+  a.titleEnglish=main.title_english||a.titleEnglish;
+  a.image=main.images?.jpg?.image_url||a.image;
+  a.status=main.status||a.status;
+  a.type=main.type||a.type;
+  a.broadcast=main.broadcast||a.broadcast;
+  const malTotal=Number.isFinite(Number(main.episodes))?Number(main.episodes):null;
+  if(malTotal)a.totalEpisodes=malTotal;
+  a.episodesSyncError=null;
+
   try{
     const first=await fetchEpisodePage(a.id,1);
-    mergeEpisodes(a,first.data||[]);
+    mergeEpisodes(a,first?.data||[]);
     const lastPage=Number(first?.pagination?.last_visible_page||1);
-    if(lastPage>1){const last=await fetchEpisodePage(a.id,lastPage);mergeEpisodes(a,last.data||[]);}
-  }catch(e){console.warn('Episodes sync failed',a.title,e);}
+    if(lastPage>1){
+      // Pour les longues séries, une seule page supplémentaire : la dernière.
+      const last=await fetchEpisodePage(a.id,lastPage);
+      mergeEpisodes(a,last?.data||[]);
+    }
+    const latest=latestReleasedNumber(a);
+    // Si MAL donne un total, on le conserve. Sinon, le dernier épisode sorti
+    // est utilisé comme nombre d'épisodes actuellement disponibles.
+    if(!a.totalEpisodes && a.status==='Finished Airing' && latest)a.totalEpisodes=latest;
+  }catch(e){
+    a.episodesSyncError=e.message||'Impossible de récupérer les épisodes.';
+    console.warn('Episodes sync failed',a.title,e);
+  }
   a.lastSynced=Date.now();
 }
+
 async function syncAll(btn){
   if(!state.anime.length)return;
   if(btn){btn.disabled=true;btn.textContent='Synchronisation…';}
@@ -357,9 +382,10 @@ async function syncAll(btn){
   state.lastSync=Date.now();save();
   if(btn){btn.disabled=false;btn.textContent='↻ Synchroniser';}
 }
-async function syncOne(id){
+async function syncOne(id,silent=false){
   const a=getAnime(id);if(!a)return;
-  try{await syncAnime(a);state.lastSync=Date.now();save();}catch(e){alert('Synchronisation impossible : '+e.message);}
+  try{await syncAnime(a);state.lastSync=Date.now();save();if(!silent && a.episodesSyncError) alert('Les épisodes n’ont pas pu être actualisés : '+a.episodesSyncError);}
+  catch(e){if(!silent)alert('Synchronisation impossible : '+e.message);}
 }
 
 function exportData(){
@@ -429,7 +455,7 @@ function render(){
       <div class="progress"><span style="width:${pct}%"></span></div>
       <div>${up?'🟢 À jour':`🔴 Vu jusqu’à l’épisode ${watched} · ${back} restant${back>1?'s':''}`}</div>
       ${!up?`<div class="next-episode"><div class="main"><div class="small muted">À regarder ensuite</div><div class="title">${nextText}</div></div><button onclick="markNextWatched(${a.id})">✓ Vu</button></div>`:''}
-      <div class="small muted" style="margin-top:7px">${latest?`Dernier épisode sorti : ${latest}`:''}${a.totalEpisodes?` · ${Math.max(0,a.totalEpisodes-watched)} épisodes avant la fin`:''}</div>
+      <div class="small muted" style="margin-top:7px">${latest?`Dernier épisode sorti : ${latest}`:''}${a.totalEpisodes?` · ${Math.max(0,a.totalEpisodes-watched)} épisodes avant la fin`:''}${a.episodesSyncError?`<br>⚠️ ${esc(a.episodesSyncError)}`:''}</div>
       <div class="anime-actions"><button onclick="openProgress(${a.id})">Modifier ma progression</button><button class="secondary" onclick="syncOne(${a.id})">↻</button><button class="danger" onclick="removeAnime(${a.id})">Retirer</button></div>
     </div></div>`;
   }).join('')+'</div>';
