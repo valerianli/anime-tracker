@@ -46,10 +46,16 @@ label.field{display:block;margin-top:13px;font-size:14px;font-weight:600}label.f
 <div class="card">
   <h2>Ajouter un anime</h2>
   <div class="toolbar">
-    <input id="search" placeholder="Rechercher sur MyAnimeList…" onkeydown="if(event.key==='Enter')searchAnime()">
+    <input id="search" placeholder="Nom de l’anime ou code MAL…" onkeydown="if(event.key==='Enter')searchAnime()">
     <button onclick="searchAnime()">Rechercher</button>
   </div>
   <div id="searchResults"></div>
+  <div class="small muted" style="margin-top:10px">Le nom est converti automatiquement en code MAL. Les correspondances déjà trouvées sont mémorisées dans ce navigateur. Si l’API de recherche est indisponible, tu peux entrer directement le code MAL.</div>
+  <div class="toolbar" style="margin-top:10px">
+    <input id="malIdDirect" type="number" min="1" placeholder="Code MAL direct, ex. 21">
+    <button class="secondary" onclick="addAnime(Number(document.getElementById('malIdDirect').value))">Ajouter via MAL ID</button>
+  </div>
+  <div id="malCacheInfo" class="small muted" style="margin-top:8px"></div>
 </div>
 
 <div class="card">
@@ -98,12 +104,14 @@ label.field{display:block;margin-top:13px;font-size:14px;font-weight:600}label.f
 const API='https://api.jikan.moe/v4';
 const KEY='anime-tracker-v4';
 const OLD_KEY='anime-tracker-v3';
+const MAL_MAP_KEY='anime-tracker-mal-map-v1';
 const SYNC_TTL=1000*60*60*12;
 const JIKAN_DELAY=1300;
 let state=loadState();
 let jikanQueue=Promise.resolve();
 let progressAnimeId=null;
 let calendarCache=null;
+let malMap=loadMalMap();
 
 function loadState(){
   try{
@@ -129,6 +137,17 @@ function normalizeState(s){
   return {anime:s.anime,lastSync:s.lastSync||null};
 }
 function save(){localStorage.setItem(KEY,JSON.stringify(state));render();}
+function loadMalMap(){
+  try{const x=JSON.parse(localStorage.getItem(MAL_MAP_KEY)||'{}');return x&&typeof x==='object'?x:{};}catch(e){return {};}
+}
+function saveMalMap(){localStorage.setItem(MAL_MAP_KEY,JSON.stringify(malMap));}
+function normalizeQuery(q){return String(q||'').trim().toLocaleLowerCase('fr-FR').replace(/\s+/g,' ');}
+function cacheMalResult(q,a){
+  const key=normalizeQuery(q); if(!key||!a?.mal_id)return;
+  malMap[key]={id:Number(a.mal_id),title:a.title||'',updatedAt:Date.now()};
+  saveMalMap();
+}
+
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));}
 function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
 function fmtDate(d){if(!d)return 'Date inconnue';return new Intl.DateTimeFormat('fr-FR',{weekday:'short',day:'2-digit',month:'2-digit',year:'numeric'}).format(new Date(d));}
@@ -163,26 +182,35 @@ function mergeEpisodes(a,eps){
   a.episodes=[...map.values()].sort((x,y)=>Number(x.number)-Number(y.number));
 }
 
+async function rawJikan(path, timeoutMs=9000){
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),timeoutMs);
+  try{
+    const r=await fetch(API+path,{headers:{Accept:'application/json'},signal:controller.signal});
+    let data=null;
+    try{data=await r.json();}catch(_){ }
+    if(r.ok)return data;
+    let msg='HTTP '+r.status;
+    if(data?.message)msg+=' — '+data.message;
+    throw new Error(msg);
+  }catch(e){
+    if(e?.name==='AbortError')throw new Error('La requête a dépassé le délai d’attente.');
+    throw e;
+  }finally{clearTimeout(timer);}
+}
+
 async function jikan(path){
   const job=jikanQueue.then(async()=>{
     await sleep(JIKAN_DELAY);
     let lastErr=null;
-    for(let attempt=0;attempt<5;attempt++){
-      try{
-        const r=await fetch(API+path,{headers:{Accept:'application/json'}});
-        if(r.ok)return await r.json();
-        let msg='HTTP '+r.status;
-        try{const j=await r.json();if(j.message)msg+=' — '+j.message;}catch(_){ }
-        lastErr=new Error(msg);
-        if(r.status===429 || [500,502,503,504].includes(r.status)){
-          await sleep(r.status===429?4000*(attempt+1):2500*(attempt+1));
-          continue;
-        }
-        throw lastErr;
-      }catch(e){
+    for(let attempt=0;attempt<4;attempt++){
+      try{return await rawJikan(path,10000);}
+      catch(e){
         lastErr=e;
-        if(attempt<4){await sleep(2500*(attempt+1));continue;}
-        throw e;
+        const msg=String(e.message||'');
+        const retryable=/HTTP (429|500|502|503|504)|délai d’attente/i.test(msg);
+        if(!retryable || attempt===3)throw e;
+        await sleep(msg.includes('HTTP 429')?3500*(attempt+1):1800*(attempt+1));
       }
     }
     throw lastErr||new Error('Jikan indisponible.');
@@ -215,15 +243,47 @@ async function fetchAnime(id){
   };
 }
 
+let searchInProgress=false;
 async function searchAnime(){
-  const q=document.getElementById('search').value.trim();if(!q)return;
-  const box=document.getElementById('searchResults');box.innerHTML='<div class="muted">Recherche…</div>';
+  const q=document.getElementById('search').value.trim();if(!q||searchInProgress)return;
+  const box=document.getElementById('searchResults');
+  searchInProgress=true;
+  box.innerHTML='<div class="muted">Recherche…</div>';
   try{
-    const j=await jikan('/anime?q='+encodeURIComponent(q)+'&limit=8&sfw=true');
-    box.innerHTML=(j.data||[]).map(a=>`<div class="result"><div><b>${esc(a.title)}</b><div class="meta">${esc(a.type||'')} · ${esc(a.status||'')} · MAL #${a.mal_id}${a.episodes?' · '+a.episodes+' épisodes':''}</div></div><button onclick="addAnime(${a.mal_id})">Ajouter</button></div>`).join('')||'<div class="muted">Aucun résultat.</div>';
+    // Un nombre est traité directement comme un MAL ID.
+    if(/^\d+$/.test(q)){
+      await addAnime(Number(q));
+      return;
+    }
+
+    // 1) Cache local : aucune requête API si cette correspondance a déjà été trouvée.
+    const cached=malMap[normalizeQuery(q)];
+    if(cached?.id){
+      box.innerHTML=`<div class="result"><div><b>${esc(cached.title||q)}</b><div class="meta">MAL #${cached.id} · correspondance mémorisée</div></div><button onclick="addAnime(${cached.id})">Ajouter</button></div>`;
+      return;
+    }
+
+    // 2) Sinon, conversion nom → MAL ID via Jikan. Cette requête est volontairement
+    // indépendante de la file de synchronisation et limitée à 8 secondes.
+    const j=await rawJikan('/anime?q='+encodeURIComponent(q)+'&limit=8&sfw=true',8000);
+    const results=j?.data||[];
+    results.forEach(a=>cacheMalResult(q,a));
+    box.innerHTML=results.length?results.map(a=>`<div class="result"><div><b>${esc(a.title)}</b><div class="meta">${esc(a.type||'')} · ${esc(a.status||'')} · <b>MAL #${a.mal_id}</b>${a.episodes?' · '+a.episodes+' épisodes':''}</div></div><button onclick="addAnime(${a.mal_id})">Ajouter</button></div>`).join(''):'<div class="muted">Aucun résultat.</div>';
   }catch(e){
-    box.innerHTML=`<div class="notice">La recherche Jikan est temporairement indisponible (${esc(e.message)}). Tu peux quand même ajouter directement un MAL ID :<div class="toolbar" style="margin-top:8px"><input id="malIdFallback" type="number" min="1" placeholder="Ex. 21 pour One Piece"><button onclick="addAnime(Number(document.getElementById('malIdFallback').value))">Ajouter via MAL ID</button></div></div>`;
+    box.innerHTML=`<div class="notice"><b>La recherche par nom est momentanément indisponible.</b><br>Le code MAL peut tout de même être utilisé directement ci-dessous.<br><span class="small muted">Une fois qu’un nom aura été trouvé, sa correspondance sera mémorisée et ne nécessitera plus cette requête.</span></div>`;
+  }finally{
+    searchInProgress=false;
+    renderMalCacheInfo();
   }
+}
+function renderMalCacheInfo(){
+  const el=document.getElementById('malCacheInfo');if(!el)return;
+  const n=Object.keys(malMap).length;
+  el.textContent=n?`${n} correspondance${n>1?'s':''} nom → MAL mémorisée${n>1?'s':''}.`:'';
+}
+function clearMalCache(){
+  if(!confirm('Effacer les correspondances nom → MAL mémorisées ?'))return;
+  malMap={};saveMalMap();renderMalCacheInfo();
 }
 
 async function addAnime(id){
@@ -377,6 +437,7 @@ function render(){
 }
 
 render();
+renderMalCacheInfo();
 </script>
 </body>
 </html>
